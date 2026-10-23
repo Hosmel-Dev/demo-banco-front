@@ -8,9 +8,8 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     server: {
       proxy: {
-        '/auth': env.ACCOUNT_SERVICE_URL || 'http://localhost:8100',
-        '/v1/accounts': env.ACCOUNT_SERVICE_URL || 'http://localhost:8100',
-        '/v1/transactions': env.TRANSACTION_SERVICE_URL || 'http://localhost:8101',
+        '/auth': env.GATEWAY_URL || 'http://localhost:8080',
+        '/v1': env.GATEWAY_URL || 'http://localhost:8080',
       },
     },
   }

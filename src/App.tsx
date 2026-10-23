@@ -1,30 +1,35 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { ApiError, getAccount, getMyAccounts, login, withdraw, type Account, type Session, type Withdrawal } from './api'
+import {
+  ApiError, deposit, getAccount, getMyAccounts, jwtExpiresAt, login, transfer, withdraw,
+  type Account, type AccountReceipt, type Currency, type Session, type TransferReceipt,
+} from './api'
+
+type Operation = 'withdrawal' | 'transfer' | 'deposit'
+type Receipt = { kind: Operation; data: AccountReceipt | TransferReceipt }
+type Busy = 'login' | 'account' | 'operation' | null
 
 const SESSION_KEY = 'bank-demo-session'
 
 function restoreSession(): Session | null {
   try {
     const stored = sessionStorage.getItem(SESSION_KEY)
-    if (!stored) return null
-    const parsed = JSON.parse(stored) as Partial<Session>
-    if (typeof parsed.token === 'string' && typeof parsed.username === 'string' &&
-      (parsed.role === 'CUSTOMER' || parsed.role === 'OPERATOR')) {
-      return parsed as Session
+    if (stored) {
+      const parsed = JSON.parse(stored) as Partial<Session>
+      if (typeof parsed.token === 'string' && typeof parsed.username === 'string' &&
+          (parsed.role === 'CUSTOMER' || parsed.role === 'OPERATOR') &&
+          (jwtExpiresAt(parsed.token) ?? 0) > Date.now()) {
+        return parsed as Session
+      }
     }
   } catch {
-    // Una sesión dañada se descarta y se solicita iniciar sesión otra vez.
+    // Una sesión dañada o vencida se descarta.
   }
   sessionStorage.removeItem(SESSION_KEY)
   return null
 }
 
-function money(amount: number, currency: string): string {
+function money(amount: number, currency: Currency): string {
   return new Intl.NumberFormat('es-PE', { style: 'currency', currency }).format(amount)
-}
-
-function readableError(error: unknown): string {
-  return error instanceof Error ? error.message : 'Ocurrió un error inesperado.'
 }
 
 function dateTime(value: string): string {
@@ -32,6 +37,17 @@ function dateTime(value: string): string {
   return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat('es-PE', {
     dateStyle: 'medium', timeStyle: 'short',
   }).format(date)
+}
+
+function readableError(error: unknown): string {
+  return error instanceof Error ? error.message : 'Ocurrió un error inesperado.'
+}
+
+function parseAmount(value: string): number | null {
+  const normalized = value.trim().replace(',', '.')
+  const amount = Number(normalized)
+  return /^\d+(\.\d{1,2})?$/.test(normalized) && amount >= 0.01 && amount <= 100000
+    ? amount : null
 }
 
 function ArrowIcon() {
@@ -49,26 +65,32 @@ function App() {
   const [accounts, setAccounts] = useState<Account[]>([])
   const [account, setAccount] = useState<Account | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
+  const [activeOperation, setActiveOperation] = useState<Operation>(
+    () => session?.role === 'OPERATOR' ? 'deposit' : 'withdrawal',
+  )
   const [amount, setAmount] = useState('')
   const [description, setDescription] = useState('')
-  const [receipt, setReceipt] = useState<Withdrawal | null>(null)
+  const [destinationNumber, setDestinationNumber] = useState('')
+  const [depositAccountId, setDepositAccountId] = useState('')
+  const [depositCurrency, setDepositCurrency] = useState<Currency>('PEN')
+  const [receipt, setReceipt] = useState<Receipt | null>(null)
   const [loginError, setLoginError] = useState('')
   const [accountError, setAccountError] = useState('')
-  const [withdrawalError, setWithdrawalError] = useState('')
+  const [operationError, setOperationError] = useState('')
   const [refreshError, setRefreshError] = useState('')
-  const [busy, setBusy] = useState<'login' | 'account' | 'withdrawal' | null>(null)
-  const pendingWithdrawal = useRef<{ signature: string; key: string } | null>(null)
+  const [busy, setBusy] = useState<Busy>(null)
+  const pendingOperation = useRef<{ signature: string; key: string } | null>(null)
 
   function signOut(message = '') {
     sessionStorage.removeItem(SESSION_KEY)
     setSession(null)
-    setAccount(null)
     setAccounts([])
+    setAccount(null)
     setReceipt(null)
     setPassword('')
     setBusy(null)
     setLoginError(message)
-    pendingWithdrawal.current = null
+    pendingOperation.current = null
   }
 
   function handleAuthError(error: unknown): boolean {
@@ -81,6 +103,20 @@ function App() {
 
   useEffect(() => {
     if (!session) return
+    const expiresAt = jwtExpiresAt(session.token)
+    if (!expiresAt || expiresAt <= Date.now()) {
+      signOut('Tu sesión venció. Inicia sesión nuevamente.')
+      return
+    }
+    const timer = window.setTimeout(
+      () => signOut('Tu sesión venció. Inicia sesión nuevamente.'),
+      Math.min(expiresAt - Date.now(), 2147483647),
+    )
+    return () => window.clearTimeout(timer)
+  }, [session])
+
+  useEffect(() => {
+    if (!session) return
     let active = true
     setBusy('account')
     setAccountError('')
@@ -88,15 +124,11 @@ function App() {
       .then(result => {
         if (!active) return
         setAccounts(result)
-        setAccount(result[0] ?? null)
+        setAccount(current => result.find(item => item.id === current?.id) ?? result[0] ?? null)
       })
       .catch(error => {
         if (!active) return
-        if (!handleAuthError(error)) {
-          setAccountError(error instanceof ApiError && error.status === 404
-            ? 'Aún no está disponible la consulta de cuentas vinculadas.'
-            : readableError(error))
-        }
+        if (!handleAuthError(error)) setAccountError(readableError(error))
       })
       .finally(() => { if (active) setBusy(null) })
     return () => { active = false }
@@ -109,6 +141,7 @@ function App() {
     try {
       const nextSession = await login(username.trim(), password)
       sessionStorage.setItem(SESSION_KEY, JSON.stringify(nextSession))
+      setActiveOperation(nextSession.role === 'OPERATOR' ? 'deposit' : 'withdrawal')
       setSession(nextSession)
       setPassword('')
     } catch (error) {
@@ -119,21 +152,13 @@ function App() {
     }
   }
 
-  async function loadAccount(id: number, token: string): Promise<Account> {
-    const result = await getAccount(id, token)
-    setAccount(result)
-    setAccounts(current => current.map(item => item.id === result.id ? result : item))
-    return result
-  }
-
   function selectAccount(id: number) {
     setAccount(accounts.find(item => item.id === id) ?? null)
     setAccountError('')
     setRefreshError('')
+    setOperationError('')
     setReceipt(null)
-    setAmount('')
-    setDescription('')
-    pendingWithdrawal.current = null
+    pendingOperation.current = null
   }
 
   async function refreshBalance() {
@@ -141,7 +166,9 @@ function App() {
     setRefreshError('')
     setBusy('account')
     try {
-      await loadAccount(account.id, session.token)
+      const updated = await getAccount(account.id, session.token)
+      setAccount(updated)
+      setAccounts(current => current.map(item => item.id === updated.id ? updated : item))
     } catch (error) {
       if (!handleAuthError(error)) setRefreshError(readableError(error))
     } finally {
@@ -149,45 +176,92 @@ function App() {
     }
   }
 
-  async function submitWithdrawal(event: FormEvent<HTMLFormElement>) {
+  function chooseOperation(operation: Operation) {
+    setActiveOperation(operation)
+    setAmount('')
+    setDescription('')
+    setOperationError('')
+    setRefreshError('')
+    setReceipt(null)
+    pendingOperation.current = null
+    if (operation === 'deposit' && account && !depositAccountId) {
+      setDepositAccountId(String(account.id))
+      setDepositCurrency(account.balance.currency)
+    }
+  }
+
+  async function submitOperation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!session || !account) return
-    setWithdrawalError('')
+    if (!session || busy !== null) return
+    setOperationError('')
     setRefreshError('')
     setReceipt(null)
 
-    const normalized = amount.trim().replace(',', '.')
-    const requestedAmount = Number(normalized)
-    if (!/^\d+(\.\d{1,2})?$/.test(normalized) || requestedAmount < 0.01 || requestedAmount > 100000) {
-      setWithdrawalError('Ingresa un monto entre 0.01 y 100 000.00, con hasta dos decimales.')
-      return
-    }
-    if (account.status !== 'ACTIVE') {
-      setWithdrawalError('La cuenta debe estar activa para realizar un retiro.')
+    const requestedAmount = parseAmount(amount)
+    if (requestedAmount === null) {
+      setOperationError('Ingresa un monto entre 0.01 y 100 000.00, con hasta dos decimales.')
       return
     }
 
-    const signature = `${account.id}|${requestedAmount.toFixed(2)}|${account.balance.currency}|${description.trim()}`
-    if (pendingWithdrawal.current?.signature !== signature) {
-      pendingWithdrawal.current = { signature, key: crypto.randomUUID() }
+    let targetId: number | null = null
+    if (activeOperation === 'deposit') {
+      if (session.role !== 'OPERATOR') {
+        setOperationError('Solo un operador puede registrar depósitos.')
+        return
+      }
+      targetId = Number(depositAccountId.trim())
+      if (!/^\d+$/.test(depositAccountId.trim()) || !Number.isSafeInteger(targetId) || targetId <= 0) {
+        setOperationError('Ingresa un ID de cuenta válido.')
+        return
+      }
+    } else {
+      if (!account) return
+      if (account.status !== 'ACTIVE') {
+        setOperationError('La cuenta de origen debe estar activa.')
+        return
+      }
+      if (activeOperation === 'transfer' && !/^\d{10,14}$/.test(destinationNumber.trim())) {
+        setOperationError('El número de cuenta destino debe tener entre 10 y 14 dígitos.')
+        return
+      }
     }
 
-    setBusy('withdrawal')
+    const currency = activeOperation === 'deposit' ? depositCurrency : account!.balance.currency
+    const signature = [activeOperation, activeOperation === 'deposit' ? targetId : account!.id,
+      activeOperation === 'transfer' ? destinationNumber.trim() : '',
+      requestedAmount.toFixed(2), currency, description.trim()].join('|')
+    if (pendingOperation.current?.signature !== signature) {
+      pendingOperation.current = { signature, key: crypto.randomUUID() }
+    }
+
+    setBusy('operation')
     try {
-      const result = await withdraw(account, requestedAmount, description, pendingWithdrawal.current.key, session.token)
-      setReceipt(result)
-      pendingWithdrawal.current = null
+      const key = pendingOperation.current.key
+      const result = activeOperation === 'withdrawal'
+        ? await withdraw(account!, requestedAmount, description, key, session.token)
+        : activeOperation === 'transfer'
+          ? await transfer(account!, destinationNumber, requestedAmount, description, key, session.token)
+          : await deposit(targetId!, requestedAmount, depositCurrency, description, key, session.token)
+
+      setReceipt({ kind: activeOperation, data: result })
+      pendingOperation.current = null
       setAmount('')
       setDescription('')
+      if (activeOperation === 'transfer') setDestinationNumber('')
+
       try {
-        await loadAccount(account.id, session.token)
+        const refreshed = await getMyAccounts(session.token)
+        setAccounts(refreshed)
+        setAccount(current => refreshed.find(item => item.id === current?.id) ?? refreshed[0] ?? null)
       } catch (error) {
-        if (!handleAuthError(error)) setRefreshError(`El retiro respondió ${result.status}, pero no se pudo actualizar el saldo: ${readableError(error)}`)
+        if (!handleAuthError(error)) {
+          setRefreshError(`La operación respondió ${result.status}, pero no se pudo actualizar el saldo: ${readableError(error)}`)
+        }
       }
     } catch (error) {
       if (!handleAuthError(error)) {
-        setWithdrawalError(error instanceof ApiError && error.status === 0
-          ? 'No se pudo confirmar el retiro. Consulta el saldo o el registro antes de intentarlo otra vez. Se conservará la misma clave de solicitud si reintentas sin cambiar los datos.'
+        setOperationError(error instanceof ApiError && error.status === 0
+          ? 'No se pudo confirmar la operación. Revisa el saldo antes de reintentar; se conservará la misma clave si no cambias los datos.'
           : readableError(error))
       }
     } finally {
@@ -195,11 +269,15 @@ function App() {
     }
   }
 
+  const operationTitle = activeOperation === 'withdrawal' ? 'Retirar dinero'
+    : activeOperation === 'transfer' ? 'Transferir dinero' : 'Registrar depósito'
+  const operationCurrency = activeOperation === 'deposit' ? depositCurrency : account?.balance.currency ?? 'PEN'
+
   return (
     <div className="app-shell">
       <header className="site-header">
         <div className="brand"><span className="brand-symbol">B<span>.</span></span><span>Banco <strong>Demo</strong></span></div>
-        {session && <div className="header-actions"><span className="user-pill"><span className="user-dot" />{session.username}</span><button className="text-button" type="button" onClick={() => signOut()}>Cerrar sesión</button></div>}
+        {session && <div className="header-actions"><span className="user-pill"><span className="user-dot" />{session.username}<span className="role-label">{session.role === 'OPERATOR' ? 'Operador' : 'Cliente'}</span></span><button className="text-button" type="button" onClick={() => signOut()}>Cerrar sesión</button></div>}
       </header>
 
       {!session ? (
@@ -207,7 +285,7 @@ function App() {
           <section className="intro-panel">
             <div className="eyebrow"><span className="eyebrow-line" /> TU BANCA, MÁS CLARA</div>
             <h1>Tu dinero,<br /><em>en buenas manos.</em></h1>
-            <p>Consulta tu cuenta y realiza retiros desde un solo lugar. Una experiencia sencilla para explorar tu banca digital.</p>
+            <p>Consulta tus cuentas y realiza retiros o transferencias desde un solo lugar. Los operadores también pueden registrar depósitos.</p>
             <div className="intro-detail"><span className="detail-icon"><WalletIcon /></span><span>Accede con tu usuario de prueba para comenzar.</span></div>
             <div className="intro-decoration" aria-hidden="true"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="orbit orbit-three" /><div className="center-glow" /></div>
           </section>
@@ -233,6 +311,7 @@ function App() {
           <div className="dashboard-heading"><div><div className="small-label">PANEL PERSONAL</div><h1>Hola, {session.username}<span className="heading-dot">.</span></h1><p>Consulta tu saldo y administra tus operaciones.</p></div><div className="demo-badge"><span /> Entorno de prueba</div></div>
 
           <div className="dashboard-grid">
+            <div className="account-column">
             <section className="card lookup-card">
               <div className="section-title"><span className="section-icon"><WalletIcon /></span><div><h2>Mis cuentas</h2><p>Vinculadas a tu usuario.</p></div></div>
               {busy === 'account' && !account && <div className="account-loading" role="status">Cargando tus cuentas…</div>}
@@ -242,23 +321,37 @@ function App() {
               {account && <div className="account-summary"><div className="account-topline"><span>{account.accountType}</span><span className={`status ${account.status === 'ACTIVE' ? 'active' : ''}`}>{account.status === 'ACTIVE' ? 'Activa' : account.status}</span></div><div className="balance-label">Saldo disponible</div><div className="balance">{money(account.balance.amount, account.balance.currency)}</div><div className="account-footer"><span>Cuenta Nº {account.accountNumber}</span><button className="refresh-button" type="button" onClick={refreshBalance} disabled={busy !== null}>Actualizar saldo</button></div></div>}
               {refreshError && <p className="alert error" role="alert">{refreshError}</p>}
             </section>
+            {receipt && <section className="receipt card" aria-live="polite"><div className="receipt-check">✓</div><div><div className="small-label">RESULTADO DE LA OPERACIÓN</div><h2>{receipt.kind === 'transfer' ? 'Transferencia' : receipt.kind === 'deposit' ? 'Depósito' : 'Retiro'} · {receipt.data.status}</h2><p>{money(receipt.data.amount, receipt.data.currency)} · Transacción Nº {receipt.data.transactionId} · {dateTime(receipt.data.createdAt)}</p>{'fromAccountId' in receipt.data && <p>Cuenta origen ID {receipt.data.fromAccountId} → destino ID {receipt.data.toAccountId}</p>}<p className="receipt-key">Clave de solicitud: {receipt.data.idempotencyKey}</p></div></section>}
+            </div>
 
             <section className="card operation-card">
-              <div className="section-title"><span className="section-icon withdrawal-icon"><ArrowIcon /></span><div><h2>Retirar dinero</h2><p>Registra un retiro desde tu cuenta.</p></div></div>
-              {!account ? <div className="empty-state"><div className="empty-symbol">↗</div><h3>Tu cuenta aparecerá aquí</h3><p>Al cargar una cuenta vinculada a tu usuario, podrás realizar un retiro.</p></div> : <form onSubmit={submitWithdrawal}>
-                <div className="selected-account">Desde <strong>Cuenta Nº {account.accountNumber}</strong><span>{account.balance.currency}</span></div>
-                <label htmlFor="amount">Monto a retirar</label>
-                <div className="amount-field"><span>{account.balance.currency === 'PEN' ? 'S/' : 'US$'}</span><input id="amount" inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} placeholder="0.00" required /></div>
-                <label htmlFor="description">Descripción <span className="optional">(opcional)</span></label>
-                <input id="description" value={description} onChange={event => setDescription(event.target.value)} maxLength={200} placeholder="Motivo del retiro" />
-                {withdrawalError && <p className="alert error" role="alert">{withdrawalError}</p>}
-                <button className="primary-button" type="submit" disabled={busy !== null || account.status !== 'ACTIVE'}>{busy === 'withdrawal' ? 'Procesando…' : 'Confirmar retiro'}<ArrowIcon /></button>
-                <p className="field-hint">El retiro se enviará a la API con una clave de solicitud única.</p>
-              </form>}
+              <div className="section-title"><span className="section-icon withdrawal-icon"><ArrowIcon /></span><div><h2>Operaciones</h2><p>Gestiona movimientos desde el Gateway.</p></div></div>
+              <div className="operation-tabs" role="tablist" aria-label="Tipo de operación">
+                <button type="button" role="tab" aria-selected={activeOperation === 'withdrawal'} className={activeOperation === 'withdrawal' ? 'selected' : ''} onClick={() => chooseOperation('withdrawal')} disabled={busy !== null}>Retiro</button>
+                <button type="button" role="tab" aria-selected={activeOperation === 'transfer'} className={activeOperation === 'transfer' ? 'selected' : ''} onClick={() => chooseOperation('transfer')} disabled={busy !== null}>Transferencia</button>
+                {session.role === 'OPERATOR' && <button type="button" role="tab" aria-selected={activeOperation === 'deposit'} className={activeOperation === 'deposit' ? 'selected' : ''} onClick={() => chooseOperation('deposit')} disabled={busy !== null}>Depósito</button>}
+              </div>
+
+              {activeOperation !== 'deposit' && !account ? (
+                <div className="empty-state"><div className="empty-symbol">↗</div><h3>Selecciona una cuenta propia</h3><p>Cuando cargue una cuenta vinculada a tu usuario, podrás operar desde ella.</p></div>
+              ) : (
+                <form onSubmit={submitOperation}>
+                  <h3 className="operation-heading">{operationTitle}</h3>
+                  {activeOperation !== 'deposit' && account && <div className="selected-account">Desde <strong>Cuenta Nº {account.accountNumber}</strong><span>{account.balance.currency}</span></div>}
+                  {activeOperation === 'transfer' && <><label htmlFor="destination-number">Número de cuenta destino</label><input id="destination-number" inputMode="numeric" value={destinationNumber} onChange={event => setDestinationNumber(event.target.value)} minLength={10} maxLength={14} pattern="[0-9]{10,14}" placeholder="10 a 14 dígitos" required /></>}
+                  {activeOperation === 'deposit' && <><div className="deposit-fields"><div><label htmlFor="deposit-account-id">ID de la cuenta destino</label><input id="deposit-account-id" inputMode="numeric" value={depositAccountId} onChange={event => setDepositAccountId(event.target.value)} placeholder="ID de cuenta" required /></div><div><label htmlFor="deposit-currency">Divisa</label><select id="deposit-currency" value={depositCurrency} onChange={event => setDepositCurrency(event.target.value as Currency)}><option value="PEN">Soles (PEN)</option><option value="USD">Dólares (USD)</option></select></div></div><p className="field-hint deposit-hint">El depósito usa el ID de cuenta que requiere la API. Solo operadores pueden registrarlo.</p></>}
+                  <label htmlFor="operation-amount">Monto</label>
+                  <div className="amount-field"><span>{operationCurrency === 'PEN' ? 'S/' : 'US$'}</span><input id="operation-amount" inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} placeholder="0.00" required /></div>
+                  <label htmlFor="operation-description">Descripción <span className="optional">(opcional)</span></label>
+                  <input id="operation-description" value={description} onChange={event => setDescription(event.target.value)} maxLength={200} placeholder="Motivo de la operación" />
+                  {operationError && <p className="alert error" role="alert">{operationError}</p>}
+                  <button className="primary-button" type="submit" disabled={busy !== null || (activeOperation !== 'deposit' && account?.status !== 'ACTIVE')}>{busy === 'operation' ? 'Procesando…' : `Confirmar ${activeOperation === 'transfer' ? 'transferencia' : activeOperation === 'deposit' ? 'depósito' : 'retiro'}`}<ArrowIcon /></button>
+                  <p className="field-hint">La solicitud incluye un JWT y una clave de operación única para reintentos.</p>
+                </form>
+              )}
             </section>
           </div>
 
-          {receipt && <section className="receipt card" aria-live="polite"><div className="receipt-check">✓</div><div><div className="small-label">RESULTADO DE LA OPERACIÓN</div><h2>Retiro {receipt.status === 'SUCCESS' ? 'registrado' : receipt.status.toLowerCase()}</h2><p>{money(receipt.amount, receipt.currency)} · Transacción Nº {receipt.transactionId} · {dateTime(receipt.createdAt)}</p><p className="receipt-key">Clave de solicitud: {receipt.idempotencyKey}</p></div></section>}
         </main>
       )}
 
